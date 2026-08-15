@@ -1,73 +1,97 @@
-import os
-import time
-import cv2
-import torch
+"""
+Module 1: Pose Extractor & Online Tracker
+Trích xuất 17 khớp chuẩn COCO từ khung hình và duy trì bộ đệm chuỗi thời gian.
+"""
+from collections import deque
 import numpy as np
-from rtmlib import RTMO, draw_skeleton
+from scipy.optimize import linear_sum_assignment
+from rtmlib import RTMO
 
-# 1. Khởi tạo mô hình RTMO ONNX
-ONNX_MODEL_PATH = '/home/muffin/Project/Previs/mmpose/rtmo-m_16xb16-600e_body7-640x640-39e78cc4_20231211/end2end.onnx'
 
-model = RTMO(
-    onnx_model=ONNX_MODEL_PATH,
-    model_input_size=(640, 640),
-    nms_thr=0.45,
-    score_thr=0.4,          # Ngưỡng bbox score
-    to_openpose=False,      # 17 khớp COCO
-    backend='onnxruntime',  # 'onnxruntime' hoặc 'tensorrt'
-    device='cuda'           # 'cuda' hoặc 'cpu'
-)
+class PoseTracker:
+    def __init__(self, onnx_model_path: str, window_size: int = 45, max_tracks: int = 2, device: str = 'cuda'):
+        self.window_size = window_size
+        self.max_tracks = max_tracks
+        self.pose_buffer = deque(maxlen=window_size)
+        
+        # Khởi tạo mô hình RTMO ONNX
+        self.model = RTMO(
+            onnx_model=onnx_model_path,
+            model_input_size=(640, 640),
+            nms_thr=0.45,
+            score_thr=0.4,
+            to_openpose=False,      # Chuẩn 17 keypoints COCO
+            backend='onnxruntime',
+            device=device
+        )
 
-print("--------- MODEL INITIALIZED ------------")
-for key, item in vars(model).items():
-    print(f"{key}: {item}")
+    @staticmethod
+    def _dist_ske(ske1: np.ndarray, ske2: np.ndarray) -> float:
+        """Tính khoảng cách hình học giữa 2 bộ khung xương."""
+        dist = np.linalg.norm(ske1[:, :2] - ske2[:, :2], axis=1) * 2
+        diff = np.abs(ske1[:, 2] - ske2[:, 2])
+        return np.sum(np.maximum(dist, diff))
 
-# 2. Mở luồng video
-source_video_path = "/home/muffin/Project/Previs/tn.mp4"
-video_capture = cv2.VideoCapture(source_video_path)
+    def _track_poses(self, thre: int = 30):
+        """Gán ID và chọn ra tối đa max_tracks khung xương chính theo chuẩn PySKL."""
+        tracks, num_tracks = [], 0
+        num_joints = 17
+        
+        for idx, poses in enumerate(self.pose_buffer):
+            if len(poses) == 0:
+                continue
+            track_proposals = [t for t in tracks if t['data'][-1][0] > idx - thre]
+            n, m = len(track_proposals), len(poses)
+            scores = np.zeros((n, m))
+            for i in range(n):
+                for j in range(m):
+                    scores[i][j] = self._dist_ske(track_proposals[i]['data'][-1][1], poses[j])
+            row, col = linear_sum_assignment(scores)
+            for r, c in zip(row, col):
+                track_proposals[r]['data'].append((idx, poses[c]))
+            if m > n:
+                for j in range(m):
+                    if j not in col:
+                        num_tracks += 1
+                        new_track = {'track_id': num_tracks, 'data': [(idx, poses[j])]}
+                        tracks.append(new_track)
 
-window_name = "PreVis - RTMO Keypoint Stream"
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        if len(tracks) == 0:
+            return None, None
 
-if not video_capture.isOpened():
-    raise RuntimeError(f"Failed to open video source: {source_video_path}")
+        # Sắp xếp lấy 2 đối tượng xuất hiện nhiều nhất trong cửa sổ trượt
+        tracks.sort(key=lambda x: -len(x['data']))
+        result = np.zeros((self.max_tracks, len(self.pose_buffer), num_joints, 3), dtype=np.float32)
+        
+        for i, track in enumerate(tracks[:self.max_tracks]):
+            for item in track['data']:
+                idx, pose = item
+                result[i, idx] = pose
 
-prev_time = time.time()
+        return result[..., :2], result[..., 2]
 
-while True:
-    success, frame_bgr = video_capture.read()
-    
-    # 1. Kiểm tra frame trước khi đưa vào model (Tránh crash khi hết video)
-    if not success or frame_bgr is None:
-        print("[*] Video ended or failed to read frame.")
-        break
+    def process_frame(self, frame: np.ndarray):
+        """
+        Xử lý từng khung hình:
+        - Trả về keypoints & scores để vẽ trực quan.
+        - Trả về dữ liệu tensor đã tracking nếu bộ đệm đã đủ số frame.
+        """
+        keypoints, scores = self.model(frame)
+        
+        current_frame_poses = []
+        if len(scores) > 0:
+            for kpt, sc in zip(keypoints, scores):
+                if np.mean(sc) > 0.2:  # Lọc khung xương rác
+                    pose_3d = np.concatenate([kpt, sc[:, None]], axis=-1)
+                    current_frame_poses.append(pose_3d)
 
-    # 2. Chạy suy luận Pose
-    start_infer = time.time()
-    keypoints, scores = model(frame_bgr)
-    infer_ms = (time.time() - start_infer) * 1000
+        self.pose_buffer.append(current_frame_poses)
 
-    # 3. Lọc bỏ các skeleton rỗng (khi trong frame không có người)
-    valid_count = 0
-    if len(scores) > 0:
-        valid_count = sum(1 for s in scores if np.mean(s) > 0.1)
+        # Kiểm tra nếu bộ đệm đã tích lũy đủ khung hình
+        is_ready = (len(self.pose_buffer) == self.window_size)
+        tracked_kpts, tracked_scores = None, None
+        
+        if is_ready:
+            tracked_kpts, tracked_scores = self._track_poses()
 
-    # 4. Vẽ khung xương trực tiếp trên ảnh BGR
-    img_show = frame_bgr.copy()
-    if valid_count > 0:
-        img_show = draw_skeleton(img_show, keypoints, scores, kpt_thr=0.3)
-
-    # 5. Tính toán và hiển thị FPS thực tế
-    current_time = time.time()
-    fps = 1.0 / (current_time - prev_time) if (current_time - prev_time) > 0 else 0
-    prev_time = current_time
-
-    info_text = f"FPS: {fps:.1f} | Infer: {infer_ms:.1f}ms | Persons: {valid_count}"
-    cv2.putText(img_show, info_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-    cv2.imshow(window_name, img_show)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-video_capture.release()
-cv2.destroyAllWindows()
+        return keypoints, scores, is_ready, tracked_kpts, tracked_scores
